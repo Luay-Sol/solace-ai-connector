@@ -1,0 +1,131 @@
+# This will create a simple JIRA ticket management flow
+#
+# It will subscribe to `solace/ai/jira` and expect an event with the payload:
+# The input message has the following schema:
+# {
+#   "input": "<Jira details as a text>"
+# }
+#
+# It will send it to an LLM to parse IT 
+# then send an event back to Solace with the topic: `solace/ai/jira/parse/response`
+#
+# NOTE: For horizontal scaling, partitioned queues must be used. This is not implemented in this example.
+#
+# Dependencies:
+# pip install -U langchain-google-vertexai langchain_anthropic langchain_openai openai
+#
+# required ENV variables:
+# - OPENAI_MODEL_NAME
+# - OPENAI_API_KEY
+# - OPENAI_API_ENDPOINT - optional
+# - SOLACE_BROKER_URL
+# - SOLACE_BROKER_USERNAME
+# - SOLACE_BROKER_PASSWORD
+# - SOLACE_BROKER_VPN
+
+---
+log:
+  stdout_log_level: INFO
+  log_file_level: INFO
+  log_file: solace_ai_connector.log
+
+shared_config:
+  # Broker connection configuration
+  - broker_config: &broker_connection
+      broker_type: solace
+      broker_url: ${SOLACE_BROKER_URL}
+      broker_username: ${SOLACE_BROKER_USERNAME}
+      broker_password: ${SOLACE_BROKER_PASSWORD}
+      broker_vpn: ${SOLACE_BROKER_VPN}
+
+  # Agent broker input configuration
+  - agent_broker_input: &agent_broker_input
+      component_name: solace_agent_broker
+      component_module: broker_input
+      component_config:
+        <<: *broker_connection
+        broker_subscriptions:
+          - topic: solace/ai/jira
+            qos: 1
+        payload_encoding: utf-8
+        payload_format: json
+  
+    # Agent broker output configuration
+  - agent_broker_output: &agent_broker_output
+      component_name: solace_agent_broker
+      component_module: broker_output
+      component_config:
+        <<: *broker_connection
+        payload_encoding: utf-8
+        payload_format: json
+        copy_user_properties: true
+      input_transforms:
+        # Copy the contents of the input event (query, id, layer_number)
+        - type: copy
+          source_expression: input.payload
+          dest_expression: user_data.output:payload
+          # Copy the output from the LLM
+        - type: copy
+          source_expression: user_data.formatted_response:content
+          dest_expression: user_data.output:payload.content
+          # Copy the agent name
+        - type: copy
+          source_expression: user_data.formatted_response:agent
+          dest_expression: user_data.output:payload.agent
+          # Copy the response topic based on input  topic
+        - type: copy
+          source_expression: template:{{text://input.topic}}/next
+          dest_expression: user_data.output:topic
+      input_selection:
+        source_expression: user_data.output
+
+  # Agent input transformations
+  - agent_input_transformations: &agent_input_transformations
+      input_transforms:
+        - type: copy
+          source_expression: |
+            template:You are a helpful AI assistant. Please help with parsing the below JIRA details
+            Your response should include details of the upgrade window, including Broker version and id, maintenance
+            start time, approval status:
+            <jira-details>
+            {{text://input.payload:query}}
+            </jira-details>
+          dest_expression: user_data.llm_input:messages.0.content
+        - type: copy
+          source_expression: static:user
+          dest_expression: user_data.llm_input:messages.0.role
+      input_selection:
+        source_expression: user_data.llm_input
+
+flows:
+  - name: Jira Parser
+    components:
+      # Broker input for OpenAI
+      - <<: *agent_broker_input
+
+      # OpenAI LLM Request
+      - component_name: llm_request
+        component_module: openai_chat_model
+        num_instances: 3
+        component_config:
+          api_key: ${OPENAI_API_KEY}
+          base_url: ${OPENAI_API_ENDPOINT}
+          model: ${OPENAI_MODEL_NAME}
+          temperature: 0.01
+        <<: *agent_input_transformations
+
+      # Format OpenAI response for broker output
+      - component_name: format_response
+        component_module: pass_through
+        input_transforms:
+          - type: copy
+            source_value: openai
+            dest_expression: user_data.formatted_response:agent
+          - type: copy
+            source_expression: previous:content
+            dest_expression: user_data.formatted_response:content
+        input_selection:
+          source_expression: user_data.formatted_response
+
+      # Broker output for OpenAI
+      - <<: *agent_broker_output
